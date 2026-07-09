@@ -1,0 +1,378 @@
+---
+title: "LOOCV"
+author: "Alyssa"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    code_folding: hide
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, message=FALSE}
+## set working directory to script location
+current_directory <- dirname(rstudioapi::getActiveDocumentContext()$path)
+knitr::opts_knit$set(root.dir=normalizePath(paste0(current_directory)))
+
+## set global chunk options
+knitr::opts_chunk$set()
+```
+
+```{r warning=FALSE, message=FALSE}
+## load libraries
+library(DSS)
+library(caret)
+library(glmnet)
+library(glmnetUtils)
+library(ggpubr)
+library(tidyverse)
+```
+
+```{r}
+## specify function to filter a single sample based on significantly related sites
+filter_sample <- function(sample_data, sig_sites) {
+  sample_data %>%
+    inner_join(sig_sites, by = c("seqid" = "chr", "start" = "pos"))
+}
+```
+
+```{r}
+### Prepare data --- 
+
+## read in data (pre-filtered based on CpG sites common to all samples)
+barcode_list_filtered <- readRDS("dataFiles/barcode_list_filtered2.rds")
+
+## extract age information
+pheno_data <- data.frame(sample = character(), age = numeric())
+
+for (sample_name in names(barcode_list_filtered)) {
+  sample_age <- barcode_list_filtered[[sample_name]]$age[1]
+  pheno_data <- rbind(pheno_data, data.frame(sample = sample_name, age = sample_age))
+}
+
+## create empty list for dss info
+dss_list <- list()
+
+## fill vector and list based on barcode_list_filtered
+for (i in seq_along(barcode_list_filtered)) {
+  
+  ## get sample name
+  sample_name <- names(barcode_list_filtered)[i] 
+  
+  ## get dss info
+  dss_temp <- barcode_list_filtered[[i]] %>% 
+    rename(chr = seqid, pos = start, N = cov, X = n_mod) %>% 
+    select(chr, pos, N, X) %>% 
+    mutate(N = as.numeric(N), X = as.numeric(X), pos = as.numeric(pos)) %>%
+    ## sort by chromosome and position 
+    arrange(chr, pos)
+  
+  ## add to list by name
+  dss_list[[sample_name]] <- dss_temp 
+  
+}
+```
+
+```{r warning=FALSE}
+## create BSseqData
+bs_obj <- makeBSseqData(dss_list, names(dss_list))
+```
+
+```{r message=FALSE}
+### Step 1. Identify significantly associated sites (filter features) ----
+
+## fit linear model to all of the data
+dml_fit <- DMLfit.multiFactor(bs_obj,
+                              design=data.frame(age=pheno_data$age),
+                              formula=~age,
+                              smoothing=TRUE)
+
+## test effect of age
+dml <- DMLtest.multiFactor(dml_fit, term = "age") ## (for exploring genomic location)
+
+## filter for significantly associated sites
+sig_sites_all <- dml %>% filter(fdrs < 0.05) ## (for exploring genomic location)
+
+## use function to filter sample data for significantly associated sites
+barcode_list_filtered_ss <- lapply(barcode_list_filtered, filter_sample, sig_sites = sig_sites_all)
+
+## extract methylation data for each sample and site
+meth_data <- NULL
+
+for (sample_name in names(barcode_list_filtered_ss)) {
+
+  sample_data <- barcode_list_filtered_ss[[sample_name]]
+
+  sample_data <- sample_data %>%
+    mutate(sample = sample_name)
+
+  sample_wide <- sample_data %>%
+    unite("id", c("seqid", "start", "end"), sep = "_") %>%
+    select(sample, id, frac_mod) %>%
+    spread(key = id, value = frac_mod)
+
+  meth_data <- bind_rows(meth_data, sample_wide)
+}
+
+## convert to matrix for modelling
+meth_data <- meth_data %>%
+  column_to_rownames(var="sample") %>%
+  as.matrix(.)
+```
+## Perform LOOCV (leave-one-out cross validation)
+
+NB: technically this is nested CV because we are also performing "inner" CV to tune the penalty (lambda) using cv.glmnet
+
+```{r warning=FALSE, message=FALSE}
+### Perform LOOCV (not performing filtering every time) ----
+
+set.seed(1234)
+
+## specify alpha (0.5 for elastic net)
+alpha_spec <- 0.5
+
+pheno_loocv <- NULL
+predictive_sites_loocv <- NULL
+
+for (i in 1:nrow(pheno_data)) {
+  
+  ### Step 2. Split data into testing and training folds ----
+  
+  ## use the sample_index to subset the training data
+  pheno_train <- pheno_data[-i, ]
+  
+  ## use the inverse sample_index to subset the testing data
+  pheno_test <- pheno_data[i, ]
+  
+  ## split into test and train
+  meth_train <- data.matrix(meth_data[pheno_train$sample, ])
+  meth_test <- data.matrix(meth_data[pheno_test$sample, , drop = FALSE])
+
+  ### Step 3. Perform inner cross validation to optimise lambda (training data only) ----
+
+  ## cross validate alpha and lambda
+  cross_validation <- cv.glmnet(x=meth_train, y=pheno_train$age)
+  
+  ## get lambda 1se
+  lambda_1se <- cross_validation$lambda.1se
+
+  ### Step 4. Build the model (training data only) ----
+  
+  ## fit a glm with elastic net regularization to the training data
+  model <- glmnet(meth_train,
+                  pheno_train$age, 
+                  family="gaussian",
+                  lambda=lambda_1se,
+                  alpha=alpha_spec)
+  
+  ## predict for training data (not used)
+  pheno_train <- pheno_train %>%
+    mutate(predicted_age = predict(model, 
+                                   meth_train, 
+                                   type="response",
+                                   s=lambda_1se)[,'s1']) %>%
+    mutate(absolute_error = abs(age - predicted_age), 
+           data_split = "Training data")
+  
+  ## predict for test data (n=1)
+  pheno_test <- pheno_test %>%
+    mutate(predicted_age = predict(model, 
+                                   meth_test, 
+                                   type="response",
+                                   s=lambda_1se)[,'s1']) %>%
+    mutate(absolute_error = abs(age - predicted_age), 
+           data_split = "Test data")
+  
+  ## combine
+  pheno_loocv <- rbind(pheno_loocv, 
+                         (full_join(pheno_train, pheno_test) %>%
+                            mutate(iteration = i, # names(sample_indices[i]),
+                                   lambda = lambda_1se)))
+  
+  ## extract the coefficients for the predictive sites
+  predictive_sites <- data.frame(as.matrix(coef(model, s=lambda_1se))) %>%
+    filter(s1 != 0) %>%
+    rownames_to_column(., var="id") %>%
+    ## remove intercept
+    filter(id != "(Intercept)") %>%
+    ## reformat locations
+    extract(id, into = c("seqid", "start", "end"),
+            regex = "(NW_\\d+\\.\\d+)_(\\d+)_(\\d+)", 
+            remove=FALSE, convert = TRUE) %>%
+    ## rename coefficient column
+    rename(coefficient = s1) %>%
+    ## add identifiers
+    mutate(cv_type = "LOOCV", 
+           iteration = i)
+  
+  ## combine
+  predictive_sites_loocv <- rbind(predictive_sites_loocv,
+                                predictive_sites)
+  
+}
+```
+
+```{r}
+## predicted ~ observed plot
+loocv_test_results <- pheno_loocv %>%
+  filter(data_split == "Test data")
+
+min_val <- min(c(loocv_test_results$age, loocv_test_results$predicted_age))
+max_val <- max(c(loocv_test_results$age, loocv_test_results$predicted_age))
+
+cl <- ggplot(loocv_test_results, aes(x=age, y=predicted_age))+
+  geom_point(alpha = 0.5) + 
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey")+
+  lims(x=c(min_val, max_val),
+       y=c(min_val, max_val))+
+  labs(x = "Observed age (years)", y = "Predicted age (years)") +
+  theme_bw()+
+  stat_cor(label.x.npc = "left", label.y.npc = "top", method = "pearson",
+           aes(label = paste(after_stat(rr.label))))
+  # stat_regline_equation(label.x.npc = "left", label.y.npc = "top") ## option for equation
+
+# cl
+```
+
+```{r}
+## absolute error plot
+el <- ggplot(loocv_test_results, aes(x = age, y = absolute_error)) +
+  geom_point(alpha=0.5)+
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2)) +
+  labs(x = "Observed age (years)",
+       y = "Absolute error (years)")+
+  lims(x=c(min(loocv_test_results$age), max(loocv_test_results$age)),
+       y=c(-0.1,1))+
+  annotate("text", x = 1, y = 1, 
+           label = paste0("MAE: ", round(mean(loocv_test_results$absolute_error), digits = 2),
+                          " (\u00B1 ", round(sd(loocv_test_results$absolute_error), digits = 2), 
+                          ")"),
+           hjust = 0, vjust = 2,
+           check_overlap = TRUE)+
+  theme_bw()
+
+# el
+```
+
+```{r fig.width=8.25, fig.height=4, message=FALSE}
+ggarrange(cl, el, nrow=1, labels=c("B", "C"))
+```
+
+```{r}
+ggsave("figuresTables/loocv_main.png", width=8.25, height=4)
+```
+
+
+## Fit final model
+
+```{r}
+## common sites
+common_sites_loocv <- predictive_sites_loocv %>%
+  group_by(id) %>%
+  summarise(count = n()) %>%
+  filter(count == max(count))
+
+paste0("Sites common to all LOOCV models: ")
+common_sites_loocv$id
+```
+
+```{r warning=FALSE}
+set.seed(1234)
+
+## get list of sites in all LOOCV models
+selected_sites <- unique(c(common_sites_loocv$id))
+
+## subset meth data for sites in any model (because all models n=0)
+meth_data_subset <- meth_data[, colnames(meth_data) %in% selected_sites]
+
+### Perform inner cross validation to optimise lambda ----
+
+## cross validate alpha and lambda
+cross_validation <- cv.glmnet(x=meth_data, y=pheno_data$age)
+
+## get lambda 1se
+lambda_1se <- cross_validation$lambda.1se
+
+## what was the optimised lambda value
+print(paste0("Optimised lambda 1se: ", round(lambda_1se, digits=4)))
+
+### Build the model ----
+
+## fit a glm with elastic net regularization to the data
+model <- glmnet(meth_data_subset,
+                pheno_data$age, 
+                family="gaussian",
+                lambda=lambda_1se,
+                alpha=alpha_spec)
+
+## extract the coefficients for the predictive sites
+predictive_sites <- data.frame(as.matrix(coef(model, s=lambda_1se))) %>%
+  filter(s1 != 0) %>%
+  rownames_to_column(., var="id") %>%
+  ## remove intercept
+  filter(id != "(Intercept)") %>%
+  ## reformat locations
+  extract(id, into = c("seqid", "start", "end"),
+          regex = "(NW_\\d+\\.\\d+)_(\\d+)_(\\d+)", 
+          # remove=FALSE, 
+          convert = TRUE) %>%
+  ## rename coefficient column
+  rename(coefficient = s1)
+
+## count the number of predictive CpG sites
+num_pred_sites <- nrow(predictive_sites)
+
+## predict for all data
+pheno_all <- pheno_data %>%
+  mutate(predicted_age = predict(model, 
+                                 meth_data_subset, 
+                                 type="response",
+                                 s=lambda_1se)[,'s1'])
+
+```
+
+
+```{r}
+min_val <- min(c(pheno_all$age, pheno_all$predicted_age))
+max_val <- max(c(pheno_all$age, pheno_all$predicted_age))
+
+cf <- ggplot(pheno_all, aes(x=age, y=predicted_age))+
+  geom_point(alpha = 0.5) + 
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey")+
+  lims(x=c(min_val, max_val),
+       y=c(min_val, max_val))+
+  labs(x = "Observed age (years)", y = "Predicted age (years)") +
+  theme_bw()+
+  # facet_wrap(.~split)+
+  stat_cor(label.x.npc = "left", label.y.npc = "top", 
+           method = "pearson", 
+           aes(label = paste(after_stat(rr.label), after_stat(p.label),
+                             sep = "~`,`~")))
+
+cf
+```
+
+NB: This plot reflects how well the model fits the current data set rather than how well it generalizes to unseen data
+
+```{r}
+print(paste0("The total number of age-related sites selected by the final model is ", num_pred_sites,
+             " out of a total possible ", (ncol(meth_data_subset))))
+```
+
+```{r}
+## export data for sites with age~meth association (according to DMLtest.multiFactor)
+write.csv(sig_sites_all, "dataFiles/age_associated_sites_dss_all.csv", row.names=FALSE) ## all data
+
+## export data for sites with age~meth association (according to loocv)
+write.csv(predictive_sites_loocv, "dataFiles/age_associated_sites_loocv.csv", row.names=FALSE)
+
+## export data for sites with age~meth association (according to loocv final model)
+write.csv(predictive_sites, "dataFiles/age_associated_sites_loocv_final.csv", row.names=FALSE)
+```
+
+```{r}
+## END SCRIPT
+```
