@@ -17,9 +17,6 @@ knitr::opts_knit$set(root.dir=normalizePath(paste0(current_directory)))
 
 ## set global chunk options
 knitr::opts_chunk$set()
-
-## set a seed globally for all chunks (not working)
-set.seed(1234)
 ```
 
 ```{r warning=FALSE, message=FALSE}

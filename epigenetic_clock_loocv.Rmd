@@ -120,6 +120,7 @@ meth_data <- meth_data %>%
   column_to_rownames(var="sample") %>%
   as.matrix(.)
 ```
+
 ## Perform LOOCV (leave-one-out cross validation)
 
 NB: technically this is nested CV because we are also performing "inner" CV to tune the penalty (lambda) using cv.glmnet
@@ -263,7 +264,6 @@ ggarrange(cl, el, nrow=1, labels=c("B", "C"))
 ```{r}
 ggsave("figuresTables/loocv_main.png", width=8.25, height=4)
 ```
-
 
 ## Fit final model
 
